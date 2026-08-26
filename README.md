@@ -12,7 +12,7 @@
 
 ## Overview & Architecture
 
-This repository documents the bottleneck analysis and key learnings from benchmarking Memcached with Extstore as part of my URA with Prof. Martin Karsten. Future work to be done is also outlined at the bottom.
+This repository documents the bottleneck analysis and key learnings from benchmarking Memcached with Extstore as part of my URA with Prof. Martin Karsten.
 
 ---
 
@@ -20,27 +20,19 @@ This repository documents the bottleneck analysis and key learnings from benchma
 
 There are two primary nodes connected via a 10-Gigabit Ethernet (10GbE) link:
 
-| Role       | Hostname  | Hardware Profile    | Storage Media             |
-| :--------- | :-------- | :------------------ | :------------------------ |
-| **Client** | `husky09` | 12 core x86_64 host | SATA SSD                  |
-| **Server** | `husky10` | 64 core x86_64 host | 2x NVMe SSDs (1.5TB each) |
+| Role       | Hostname  | Hardware Profile    | Storage Media             | Memory  |
+| :--------- | :-------- | :------------------ | :------------------------ | :------ |
+| **Client** | `husky09` | 12 core x86_64 host | SATA SSD                  | 62 GiB  |
+| **Server** | `husky10` | 64 core x86_64 host | 2x NVMe SSDs (1.5TB each) | 251 GiB |
 
 Physical link speeds and network interface controllers (NICs) were verified on the server (`husky10`):
 
-```bash
-ip link
-sudo ethtool enp2s0f0np0
-lspci | grep -i ethernet
-```
-
 - **Active Network Interface:** `enp2s0f0np0`
 - **Negotiated Link Speed:** `10000Mb/s` (10 Gbps Full Duplex)
-- **NIC Hardware:** Intel Corporation Ethernet Controller E810-XXV for SFP (rev 02) & Intel 10-Gigabit X540-AT2 (rev 01)
+- **NIC:** Intel Corporation Ethernet Controller E810-XXV for SFP (rev 02) & Intel 10-Gigabit X540-AT2 (rev 01)
 - **Physical Upper Bound:** Network payload bandwidth is capped at **10 Gbps (~1.25 GB/s theoretical maximum)**.
 
-The NVMe SSD on husky10 was verified to be HWE36P43016M000N MLC (likely with no SLC buffer).
-
-- via `lsblk -d -o NAME,MODEL,SERIAL,SIZE`
+The NVMe SSD on husky10 is the HWE36P43016M000N MLC SSD (likely with no SLC buffer).
 
 ---
 
@@ -105,27 +97,25 @@ sudo apt update
 sudo apt install -y build-essential scons libevent-dev gengetopt libzmq3-dev
 ```
 
-### SConscript Python 3 Patching & Compilation
+### Mutilate SConscript Patching & Compilation
 
-Because standard Ubuntu (e.g., 24.04 Noble) ships with Python 3 while original `mutilate` build scripts utilize Python 2 syntax, the `SConscript` file was updated:
-
-1. Replaced all legacy Python 2 `print` statements with standard Python 3 `print(...)` function calls.
-2. Executed build and increased open file descriptor limits (allows more connections to be sent out):
+Because standard Ubuntu ships with Python 3 while original `mutilate` build scripts use Python 2 syntax, the mutilate repository was updated with the patch file in [Martin Karsten's KernelWork Repository](https://git.uwaterloo.ca/mkarsten/kernelwork/-/blob/main/patches/mutilate.patch?ref_type=heads). In addition, the file descriptor limit was increased to 65536 via the command below to allow for more connections for the mutilate client.
 
 ```bash
-scons
-# elevate file descriptor limits for high concurrency
-ulimit -n 65535
+ulimit -n 65535 # Increase FD limit
+scons # compile mutilate
 ```
 
 ### Dataset Warmup & Initial Verification
+
+To test that you have setup the server and client properly, run a test benchmark:
 
 ```bash
 ./mutilate -s <server IP>:11211 --loadonly
 ./mutilate -s <server IP>:11211 -T 8 -c 16 -t 10
 ```
 
-Result:
+You should see a result printed similar to the result below after the benchmark has ended.
 
 ```
 type       avg     std     min     5th    10th    90th    95th    99th
@@ -179,20 +169,20 @@ TX  200990196 bytes :    6.4 MB/s
 2. **Disk I/O (`iostat -xz 1`):**
    - NVMe utilization (`%util`) was **0.00%**.
    - `%iowait` across CPU cores was **0.00%**.
-3. **CPU Utilization (`mpstat` / `top`):**
+3. **CPU Utilization (`iostat -xz 1`):**
    - User CPU: `2.26%`
    - System CPU (Kernel TCP/IP processing): `19.62%`
    - Idle CPU: `78.12%`
 
 #### Analysis:
 
-Values sized at $6,192B$ were below the `ext_item_size=8192` offloading threshold, serving all queries directly out of memory. The workload hit a physical bottleneck at the 10GbE network interface\*\* (98.21% interface utilization), while storage remained untouched and a large amount of CPU capacity remained unused. So we can conclude that this workload was network bound.
+Values sized at $6,192B$ were below the `ext_item_size=8192` threshold, meaning all queries were served out of memory. The workload hit a physical bottleneck at the 10GbE network interface (98.21% interface utilization), while storage remained untouched and a large amount of CPU capacity remained unused. So we can conclude that this workload was network bound.
 
 ---
 
 ### Experiment 2: Storage Bound Extstore Test (with Linux Page Cache)
 
-To force data offloading onto the NVMe Extstore layer, server DRAM was intentionally restricted to 32 MB and populated with large items.
+To force data offloading onto the NVMe Extstore layer, server DRAM was intentionally restricted to 32 MB and populated with large items above the extstore item size limit.
 
 #### Server Execution:
 
@@ -247,7 +237,7 @@ Initially, the results looked exactly the same as our network bound test, but af
 
 ### Analysis
 
-With only 32 MB of DRAM and 10KB item sizes, all of the items should get offloaded to extstore (SSD), so why are the results initially the same? The reason is probably because of the Linux page cache. Extstore in this experiment uses a 2MB write buffer in memory before sending items to a write syscall. The linux page cache then caches these writes in memory, which makes writing to the SSD seem really quick during most of the benchmark. However, once the OS Page Cache filled up completely, the system flushed these writes into the SSD, causing the storage bottleneck observed by iostat above.
+With only 32 MB of DRAM and 10KB item sizes, all of the items should get offloaded to extstore (SSD), so why are the results initially the same? The reason is probably because of the Linux page cache. Extstore in this experiment uses a 2MB write buffer in memory before sending items to a write syscall. The linux page cache then caches these writes in memory, which explains why the disk util is 0% for most of the benchmark. However, extstore does garbage collection on its pages and will rewrite old items on pages to newer pages during the GC process - this probably explains the high disk usage later in the experiment when extstore GC threads run.
 
 ---
 
@@ -255,7 +245,7 @@ With only 32 MB of DRAM and 10KB item sizes, all of the items should get offload
 
 To bypass kernel page cache, Memcached was modified to use `O_DIRECT` for for Extstore storage reads/writes (see memcached folder of this repository for changes). Linux file alignment for O_DIRECT require file offsets, lengths, and memory buffers to be aligned to filesystem block boundaries (4096 bytes).
 
-Memcached was built, compiled and tested via the commands in the README of [github.com/memcached/memcached](https://github.com/memcached/memcached)
+Memcached was built, compiled and tested via the commands in the README of [github.com/memcached/memcached](https://github.com/memcached/memcached). The memcached direct IO changes are linked in `memcached.patch`.
 
 Server launch command:
 
@@ -292,23 +282,17 @@ TX  219658392 bytes :    3.5 MB/s
 
 ### Analysis:
 
-In the first 40 seconds, the results were network bound, with usage of SSD this time:
+In the first 40 seconds, the results were network bound, with low usage of SSD this time:
 
 - Network (`sar -n DEV 1`): rxkB/s = 1,190,063.95 (~1.19 GB/s), %ifutil = 97.49%
-
 - Disk (`iostat -xz 1`): Writes = 2,960 w/s (~378.8 MB/s), %util = 13.0% - 14.2%
 
 However, in the last ~20 seconds of the benchmark, results seemed to be completely storage bound
 
 - Network (`sar -n DEV 1`): Transmit payload drops to txkB/s = 243,117.35 (~243 MB/s), %ifutil = 19.92%
-
 - Disk (`iostat -xz 1`): Direct reads reach 22,936 r/s (~317.2 MB/s), driving %util to 99.9% – 100.0%
 
-We can see from these results that overall throughput decrease to 221 MB/s, which makes sense since we are bypassing the kernel cache. We are also definitely using more SSD than experiment 2, verifying that the O_DIRECT flag has worked. I suspect the reason why storage jumps so high in the last few seconds may be of two reasons:
-
-1. Extstore page compaction activates later on to reclaim fragmented page, adding internal read/write overhead on the SSD, shooting its usage up to 100%
-
-2. Our SSD has a SLC buffer (SLC is faster than MLC) that makes initial reads/writes super fast (this is unlikely with our type of SSD, since our SSD is enterprise).
+We can see from these results that overall throughput decrease to 221 MB/s, which makes sense since we are bypassing the kernel cache. We are using more SSD in the beginning of the experiment than experiment 2, verifying that the O_DIRECT flag has worked. The reason why the disk util shoots up in the last few seconds of the benchmark is likely still due to the page GC, as explained earlier.
 
 ## Summary of Learnings
 
@@ -322,4 +306,4 @@ We can see from these results that overall throughput decrease to 221 MB/s, whic
 
 ## Future Work
 
-Future work requires more analysis into the exact reason why we get the results we do in experiment 3.
+Future work requires more analysis into filesystem vs operating system overhead (potentially using SPDK), and confirming the analysis of experiment 3 (verifying that GC is the reason why disk usage shoots up to 100% later in the benchmark).
